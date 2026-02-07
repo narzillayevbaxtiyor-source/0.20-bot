@@ -177,8 +177,11 @@ async def get_price_map(session: aiohttp.ClientSession, symbols: List[str]) -> D
 # CHART RENDER
 # ======================
 def render_candles_png(symbol: str, interval: str, candles: List[Candle], lines: List[Tuple[str, float]]) -> str:
-    # Simple candle chart
-    xs = list(range(len(candles)))
+    # ✅ Candle spacing (orasini ochish)
+    # step katta bo'lsa shamlar uzoqlashadi (aniqroq ko'rinadi)
+    step = 2.2
+    xs = [i * step for i in range(len(candles))]
+
     o = [c.open for c in candles]
     h = [c.high for c in candles]
     l = [c.low for c in candles]
@@ -188,27 +191,30 @@ def render_candles_png(symbol: str, interval: str, candles: List[Candle], lines:
     ax = fig.add_subplot(111)
     ax.set_title(f"{symbol} | {interval}")
 
+    # Sham tanasi va soyasi qalinligini step ga mos qilamiz
+    wick_lw = 1.1
+    body_lw = 6.5
+
     for i in range(len(candles)):
-        ax.vlines(xs[i], l[i], h[i], linewidth=1)
+        ax.vlines(xs[i], l[i], h[i], linewidth=wick_lw)  # wick
         body_low = min(o[i], cl[i])
         body_high = max(o[i], cl[i])
-        ax.vlines(xs[i], body_low, body_high, linewidth=6)
+        ax.vlines(xs[i], body_low, body_high, linewidth=body_lw)  # body
 
+    # chiziqlar (PRICE / MAX) aniq ko'rinsin
     for label, y in lines:
-        ax.hlines(y, xs[0], xs[-1], linestyles="dashed", linewidth=1)
+        ax.hlines(y, xs[0], xs[-1], linestyles="dashed", linewidth=1.4)
         ax.text(xs[0], y, f" {label}:{y:.6f}", va="bottom")
 
-    # ✅ MUHIM O'ZGARISH:
     # Oxirgi YOPILGAN shamni (candles[-2]) o'rtaga keltiramiz.
-    # Binance klines: candles[-1] = hozir shakllanayotgan (ochiq), candles[-2] = oxirgi yopilgan.
     if len(xs) >= 2:
-        center = xs[-2]                 # last closed candle index
+        center = xs[-2]
     else:
         center = xs[-1]
 
-    half = max(10, len(xs) // 2)        # ko'rinish oynasi yarim kengligi
-    left = max(0, center - half)
-    right = center + half               # right ni ataylab oshiramiz (bo'sh joy ham bo'ladi)
+    half = max(10, len(xs) // 2) * step
+    left = max(0.0, center - half)
+    right = center + half
     ax.set_xlim(left, right)
 
     ax.grid(True, linewidth=0.3)
@@ -216,7 +222,7 @@ def render_candles_png(symbol: str, interval: str, candles: List[Candle], lines:
 
     out_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
     plt.tight_layout()
-    plt.savefig(out_path, dpi=160)
+    plt.savefig(out_path, dpi=180)
     plt.close(fig)
     return out_path
 
@@ -384,7 +390,7 @@ async def main():
     connector = aiohttp.TCPConnector(limit=50, ssl=False)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near/break + 15m sell (last CLOSED candle centered)")
+        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near/break + 15m sell (spaced candles + last CLOSED centered)")
 
         tasks = [
             asyncio.create_task(loop_refresh_top(session, st)),
