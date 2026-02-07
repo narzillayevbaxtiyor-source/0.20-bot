@@ -126,11 +126,9 @@ async def tg_send_photo(session: aiohttp.ClientSession, caption: str, image_path
 # BINANCE DATA
 # ======================
 async def get_top_gainers(session: aiohttp.ClientSession, top_n: int) -> List[str]:
-    # /api/v3/ticker/24hr returns array of tickers
     url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
     data = await http_get_json(session, url)
 
-    # Keep only USDT spot-like pairs (simple filter)
     usdt = []
     for x in data:
         sym = x.get("symbol", "")
@@ -138,7 +136,6 @@ async def get_top_gainers(session: aiohttp.ClientSession, top_n: int) -> List[st
             continue
         if sym.endswith("BUSDUSDT") or sym.endswith("USDCUSDT"):
             continue
-        # ignore leveraged tokens etc (optional)
         if "UPUSDT" in sym or "DOWNUSDT" in sym or "BULLUSDT" in sym or "BEARUSDT" in sym:
             continue
         try:
@@ -166,7 +163,6 @@ async def get_klines(session: aiohttp.ClientSession, symbol: str, interval: str,
     return out
 
 async def get_price_map(session: aiohttp.ClientSession, symbols: List[str]) -> Dict[str, float]:
-    # ticker/price returns all; we filter by our symbols (fast enough)
     url = f"{BINANCE_BASE}/api/v3/ticker/price"
     data = await http_get_json(session, url)
     wanted = set(symbols)
@@ -182,13 +178,11 @@ async def get_price_map(session: aiohttp.ClientSession, symbols: List[str]) -> D
 # ======================
 def render_candles_png(symbol: str, interval: str, candles: List[Candle], lines: List[Tuple[str, float]]) -> str:
     # Simple candle chart
-    # Each candle: vertical line (low-high), body (open-close)
-    # lines: list of (label, y)
     xs = list(range(len(candles)))
     o = [c.open for c in candles]
     h = [c.high for c in candles]
     l = [c.low for c in candles]
-    c = [c.close for c in candles]
+    cl = [c.close for c in candles]
 
     fig = plt.figure(figsize=(10, 5))
     ax = fig.add_subplot(111)
@@ -196,15 +190,27 @@ def render_candles_png(symbol: str, interval: str, candles: List[Candle], lines:
 
     for i in range(len(candles)):
         ax.vlines(xs[i], l[i], h[i], linewidth=1)
-        body_low = min(o[i], c[i])
-        body_high = max(o[i], c[i])
+        body_low = min(o[i], cl[i])
+        body_high = max(o[i], cl[i])
         ax.vlines(xs[i], body_low, body_high, linewidth=6)
 
     for label, y in lines:
         ax.hlines(y, xs[0], xs[-1], linestyles="dashed", linewidth=1)
         ax.text(xs[0], y, f" {label}:{y:.6f}", va="bottom")
 
-    ax.set_xlim(xs[0], xs[-1])
+    # ✅ MUHIM O'ZGARISH:
+    # Oxirgi YOPILGAN shamni (candles[-2]) o'rtaga keltiramiz.
+    # Binance klines: candles[-1] = hozir shakllanayotgan (ochiq), candles[-2] = oxirgi yopilgan.
+    if len(xs) >= 2:
+        center = xs[-2]                 # last closed candle index
+    else:
+        center = xs[-1]
+
+    half = max(10, len(xs) // 2)        # ko'rinish oynasi yarim kengligi
+    left = max(0, center - half)
+    right = center + half               # right ni ataylab oshiramiz (bo'sh joy ham bo'ladi)
+    ax.set_xlim(left, right)
+
     ax.grid(True, linewidth=0.3)
     ax.set_xticks([])
 
@@ -218,7 +224,6 @@ def render_candles_png(symbol: str, interval: str, candles: List[Candle], lines:
 # LOGIC
 # ======================
 def last_closed(candles: List[Candle]) -> Candle:
-    # Binance klines include forming candle at end; last closed is candles[-2]
     if len(candles) < 2:
         raise ValueError("Not enough candles")
     return candles[-2]
@@ -229,10 +234,6 @@ async def refresh_symbol_klines_cached(
     symbol: str,
     cache: Dict[str, Dict[str, Any]],
 ) -> None:
-    """
-    cache structure:
-    cache[symbol][interval] = {"t": last_fetch_ms, "candles": List[Candle]}
-    """
     for interval, limit in [("1w", 3), ("1d", 3), ("4h", 5), ("15m", 5)]:
         entry = cache.setdefault(symbol, {}).get(interval)
         tnow = now_ms()
@@ -257,17 +258,12 @@ async def refresh_symbol_klines_cached(
             if ss["last_4h_closed_open"] != closed.open_time:
                 ss["last_4h_closed_open"] = closed.open_time
                 ss["last_4h_high"] = closed.high
-                # reset per-4h flags for near/break
                 ss["near_sent_for_4h"] = None
                 ss["break_sent_for_4h"] = None
-                # if new 4h candle closed, also reset upmove (optional)
-                # ss["upmove_active"] = False
         elif interval == "15m":
             if ss["last_15m_closed_open"] != closed.open_time:
                 ss["last_15m_closed_open"] = closed.open_time
                 ss["last_15m_low"] = closed.low
-                # allow sell again on new 15m candle if needed
-                # ss["sell_sent_15m"] = None
 
 async def handle_signals(
     session: aiohttp.ClientSession,
@@ -278,60 +274,54 @@ async def handle_signals(
 ) -> None:
     ss = sym_state(st, symbol)
 
-    # Need 4H max
     last4h_high = ss.get("last_4h_high")
     last4h_open = ss.get("last_4h_closed_open")
-
-    # Need daily just closed? We interpret: if today we already got daily close event, then "daily is closed"
     daily_closed_open = ss.get("last_1d_closed_open")
 
-    # If we don't have data yet, skip
     if not last4h_high or not last4h_open or not daily_closed_open:
         return
 
-    # 1) Near the max (within 1% below 4h high)
     near_level = last4h_high * (1.0 - NEAR_PCT)
     if price >= near_level and price < last4h_high:
         if ss.get("near_sent_for_4h") != last4h_open:
             ss["near_sent_for_4h"] = last4h_open
 
-            # chart: show last ~CHART_CANDLES on 4h (we only cached 5 by default; fetch bigger for image)
             candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
-            img = render_candles_png(symbol, "4h", candles[-CHART_CANDLES:], [
-                ("4H_MAX", last4h_high),
+            view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
+            img = render_candles_png(symbol, "4h", view, [
                 ("PRICE", price),
+                ("4H_MAX", last4h_high),
             ])
             await tg_send_photo(session, f"🟨 near the max | {symbol}\nprice={price}\n4h_max={last4h_high}", img)
 
-    # 2) Break the max
     if price >= last4h_high:
         if ss.get("break_sent_for_4h") != last4h_open:
             ss["break_sent_for_4h"] = last4h_open
             ss["upmove_active"] = True
             ss["upmove_started_4h"] = last4h_open
-            ss["sell_sent_15m"] = None  # reset sell gate on new break
+            ss["sell_sent_15m"] = None
 
             candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
-            img = render_candles_png(symbol, "4h", candles[-CHART_CANDLES:], [
-                ("4H_MAX", last4h_high),
+            view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
+            img = render_candles_png(symbol, "4h", view, [
                 ("PRICE", price),
+                ("4H_MAX", last4h_high),
             ])
             await tg_send_photo(session, f"🟩 price break the max | {symbol}\nprice={price}\n4h_max={last4h_high}", img)
 
-    # 3) After upmove started -> 15m SELL if price crosses below last closed 15m low
     if ss.get("upmove_active"):
         last15m_low = ss.get("last_15m_low")
         last15m_open = ss.get("last_15m_closed_open")
         if last15m_low and last15m_open:
             if price < last15m_low:
-                # fire only once per 15m candle
                 if ss.get("sell_sent_15m") != last15m_open:
                     ss["sell_sent_15m"] = last15m_open
 
                     candles15 = await get_klines(session, symbol, "15m", min(CHART_CANDLES, 200))
-                    img = render_candles_png(symbol, "15m", candles15[-CHART_CANDLES:], [
-                        ("15M_LOW", last15m_low),
+                    view15 = candles15[-CHART_CANDLES:] if len(candles15) > CHART_CANDLES else candles15
+                    img = render_candles_png(symbol, "15m", view15, [
                         ("PRICE", price),
+                        ("15M_LOW", last15m_low),
                     ])
                     await tg_send_photo(
                         session,
@@ -364,7 +354,6 @@ async def loop_refresh_klines(session: aiohttp.ClientSession, st: Dict[str, Any]
             try:
                 await refresh_symbol_klines_cached(session, st, symbol, cache)
             except Exception as e:
-                # don't spam too much
                 print("kline refresh error", symbol, e)
         save_state(st)
         await asyncio.sleep(REFRESH_KLINES_SEC)
@@ -391,13 +380,11 @@ async def main():
     st = load_state()
     cache: Dict[str, Dict[str, Any]] = {}
 
-    await asyncio.sleep(0.1)
-
     timeout = aiohttp.ClientTimeout(total=20)
     connector = aiohttp.TCPConnector(limit=50, ssl=False)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near/break + 15m sell (with charts)")
+        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near/break + 15m sell (last CLOSED candle centered)")
 
         tasks = [
             asyncio.create_task(loop_refresh_top(session, st)),
