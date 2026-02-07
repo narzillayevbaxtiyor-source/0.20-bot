@@ -192,8 +192,8 @@ def render_candles_png(symbol: str, interval: str, candles: List[Candle], lines:
     ax.set_title(f"{symbol} | {interval}")
 
     # Sham tanasi va soyasi qalinligini step ga mos qilamiz
-    wick_lw = 1.1
-    body_lw = 6.5
+    wick_lw = 0.8
+    body_lw = 3.0
 
     for i in range(len(candles)):
         ax.vlines(xs[i], l[i], h[i], linewidth=wick_lw)  # wick
