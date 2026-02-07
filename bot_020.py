@@ -179,7 +179,7 @@ async def get_price_map(session: aiohttp.ClientSession, symbols: List[str]) -> D
 def render_candles_png(symbol: str, interval: str, candles: List[Candle], lines: List[Tuple[str, float]]) -> str:
     # ✅ Candle spacing (orasini ochish)
     # step katta bo'lsa shamlar uzoqlashadi (aniqroq ko'rinadi)
-    step = 2.5
+    step = 3.5
     xs = [i * step for i in range(len(candles))]
 
     o = [c.open for c in candles]
