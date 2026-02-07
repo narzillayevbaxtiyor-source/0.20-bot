@@ -1,1 +1,3 @@
-pip install aiohttp python-dotenv matplotlib
+aiohttp==3.9.5
+python-dotenv==1.0.1
+matplotlib==3.8.4
