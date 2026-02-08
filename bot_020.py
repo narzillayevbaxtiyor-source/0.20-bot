@@ -94,6 +94,10 @@ def sym_state(st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
             "upmove_active": False,
             "upmove_started_4h": None,   # 4h open_time that triggered break
             "sell_sent_15m": None,       # 15m open_time when sell fired
+
+            # ✅ NEW (faqat BUY gating uchun):
+            "buy_armed_daily": None,     # 1D yopilganda shu yerga daily open_time yoziladi
+            "buy_done_daily": None,      # shu daily uchun BUY 1 marta chiqqan bo'lsa daily open_time yoziladi
         }
         st["symbols"][symbol] = s
     return s
@@ -292,6 +296,11 @@ async def refresh_symbol_klines_cached(
         elif interval == "1d":
             if ss["last_1d_closed_open"] != closed.open_time:
                 ss["last_1d_closed_open"] = closed.open_time
+
+                # ✅ NEW: 1D yopilganda BUY'ni "arm" qilamiz (shu daily uchun 1 marta ruxsat)
+                ss["buy_armed_daily"] = closed.open_time
+                ss["buy_done_daily"] = None
+
                 await tg_send_text(session, f"📅 DAILY CLOSED | {symbol} | close={closed.close}")
         elif interval == "4h":
             if ss["last_4h_closed_open"] != closed.open_time:
@@ -328,7 +337,7 @@ async def handle_signals(
             candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
             view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
 
-            # ✅ NEW: 1D dan pivot zone (qizil sham tanasi) olamiz
+            # 1D dan pivot zone (qizil sham tanasi) olamiz
             d1 = await get_klines(session, symbol, "1d", 200)
             zone = last_green_then_red_body_zone(d1)
 
@@ -339,6 +348,31 @@ async def handle_signals(
 
             await tg_send_photo(session, f"🟨 near the max | {symbol}\nprice={price}\n4h_max={last4h_high}", img)
 
+    # ✅ NEW: 1D yopilgandan keyin faqat 1 marta BUY
+    # Shart:
+    # - daily yopilgan bo'lishi kerak (buy_armed_daily == last_1d_closed_open)
+    # - shu daily uchun hali BUY chiqmagan bo'lishi kerak (buy_done_daily != last_1d_closed_open)
+    # - price oxirgi yopilgan 4H high ni kesib o'tishi kerak (price >= last4h_high)
+    if (
+        ss.get("buy_armed_daily") == daily_closed_open
+        and ss.get("buy_done_daily") != daily_closed_open
+        and price >= last4h_high
+    ):
+        ss["buy_done_daily"] = daily_closed_open
+
+        candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
+        view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
+        img = render_candles_png(symbol, "4h", view, [
+            ("PRICE", price),
+            ("4H_MAX", last4h_high),
+        ])
+        await tg_send_photo(
+            session,
+            f"🟦 BUY (daily 1x) | {symbol}\nprice={price}\n4h_max={last4h_high}",
+            img,
+        )
+
+    # (old) break the max — tegmadim
     if price >= last4h_high:
         if ss.get("break_sent_for_4h") != last4h_open:
             ss["break_sent_for_4h"] = last4h_open
