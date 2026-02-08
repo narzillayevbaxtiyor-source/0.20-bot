@@ -112,7 +112,7 @@ async def http_get_json(session: aiohttp.ClientSession, url: str, params: Option
 
 async def tg_send_text(session: aiohttp.ClientSession, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
     async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=15)) as r:
         await r.text()
 
