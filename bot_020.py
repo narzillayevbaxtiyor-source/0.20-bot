@@ -1,5 +1,6 @@
 import os
 import time
+import math
 import json
 import asyncio
 from dataclasses import dataclass
@@ -92,12 +93,7 @@ def sym_state(st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
 
             "upmove_active": False,
             "upmove_started_4h": None,   # 4h open_time that triggered break
-
-            # old
-            "sell_sent_15m": None,
-
-            # ✅ NEW: sell only once after each break
-            "sell_once_done_for_break": None,  # stores upmove_started_4h when SELL already fired
+            "sell_sent_15m": None,       # 15m open_time when sell fired
         }
         st["symbols"][symbol] = s
     return s
@@ -185,9 +181,10 @@ def render_candles_png(
     interval: str,
     candles: List[Candle],
     lines: List[Tuple[str, float]],
-    pivot: Optional[Tuple[str, float]] = None,   # ("PIVOT_RES", price)
+    pivot_zone: Optional[Tuple[float, float]] = None,   # ✅ NEW: (zone_low, zone_high)
 ) -> str:
-    # Candle spacing
+    # ✅ Candle spacing (orasini ochish)
+    # step katta bo'lsa shamlar uzoqlashadi (aniqroq ko'rinadi)
     step = 2.2
     xs = [i * step for i in range(len(candles))]
 
@@ -200,28 +197,32 @@ def render_candles_png(
     ax = fig.add_subplot(111)
     ax.set_title(f"{symbol} | {interval}")
 
+    # Sham tanasi va soyasi qalinligini step ga mos qilamiz
     wick_lw = 1.1
     body_lw = 6.5
 
     for i in range(len(candles)):
-        ax.vlines(xs[i], l[i], h[i], linewidth=wick_lw)
+        ax.vlines(xs[i], l[i], h[i], linewidth=wick_lw)  # wick
         body_low = min(o[i], cl[i])
         body_high = max(o[i], cl[i])
-        ax.vlines(xs[i], body_low, body_high, linewidth=body_lw)
+        ax.vlines(xs[i], body_low, body_high, linewidth=body_lw)  # body
 
+    # chiziqlar (PRICE / MAX) aniq ko'rinsin
     for label, y in lines:
         ax.hlines(y, xs[0], xs[-1], linestyles="dashed", linewidth=1.4)
         ax.text(xs[0], y, f" {label}:{y:.6f}", va="bottom")
 
-    # ✅ Pivot resistance marker (near the max da 1D chart uchun)
-    if pivot is not None:
-        p_label, p_y = pivot
-        ax.hlines(p_y, xs[0], xs[-1], linestyles="dashed", linewidth=2.0)
-        ax.text(xs[0], p_y, f" {p_label}:{p_y:.6f}", va="bottom")
-        # dot at right side for visibility
-        ax.scatter([xs[-2] if len(xs) >= 2 else xs[-1]], [p_y], s=40)
+    # ✅ NEW: Pivot resistance zone (qizil sham TANASI: open-close oralig'i)
+    if pivot_zone is not None:
+        z_low, z_high = pivot_zone
+        # zone chiziqlari
+        ax.hlines(z_low, xs[0], xs[-1], linestyles="dashed", linewidth=2.0)
+        ax.hlines(z_high, xs[0], xs[-1], linestyles="dashed", linewidth=2.0)
+        ax.text(xs[0], z_high, f" RES_BODY:{z_low:.6f}-{z_high:.6f}", va="bottom")
+        # zone fon (shaded)
+        ax.fill_between([xs[0], xs[-1]], [z_low, z_low], [z_high, z_high], alpha=0.12)
 
-    # last CLOSED candle centered
+    # Oxirgi YOPILGAN shamni (candles[-2]) o'rtaga keltiramiz.
     if len(xs) >= 2:
         center = xs[-2]
     else:
@@ -249,24 +250,21 @@ def last_closed(candles: List[Candle]) -> Candle:
         raise ValueError("Not enough candles")
     return candles[-2]
 
-def find_last_green_then_red_pivot(d1: List[Candle]) -> Optional[float]:
-    """
-    1D candles list includes forming candle at end; we search among CLOSED candles.
-    Find last pattern: green candle then next candle red.
-    Return pivot price = CLOSE of the RED candle (yopilgan nuqta).
-    """
+# ✅ NEW: 1D da oxirgi (green -> red) pattern topib,
+# qizil sham TANASI (open-close) zonani qaytaradi.
+def last_green_then_red_body_zone(d1: List[Candle]) -> Optional[Tuple[float, float]]:
     if len(d1) < 4:
         return None
-    # closed range: up to -2
-    closed = d1[:-1]
-    # scan backwards on indices (need i-1 and i)
+    closed = d1[:-1]  # forming candle'ni chiqarib tashlaymiz
     for i in range(len(closed) - 1, 0, -1):
         prev = closed[i - 1]
         cur = closed[i]
         prev_green = prev.close > prev.open
         cur_red = cur.close < cur.open
         if prev_green and cur_red:
-            return cur.close
+            z_low = min(cur.open, cur.close)
+            z_high = max(cur.open, cur.close)
+            return (z_low, z_high)
     return None
 
 async def refresh_symbol_klines_cached(
@@ -322,42 +320,31 @@ async def handle_signals(
     if not last4h_high or not last4h_open or not daily_closed_open:
         return
 
-    # 1) near the max  (✅ now shows 1D chart + pivot resistance)
     near_level = last4h_high * (1.0 - NEAR_PCT)
     if price >= near_level and price < last4h_high:
         if ss.get("near_sent_for_4h") != last4h_open:
             ss["near_sent_for_4h"] = last4h_open
 
-            # 1D candles for pivot + chart
-            d1 = await get_klines(session, symbol, "1d", min(200, max(CHART_CANDLES, 80)))
-            pivot_price = find_last_green_then_red_pivot(d1)
-            view1d = d1[-CHART_CANDLES:] if len(d1) > CHART_CANDLES else d1
+            candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
+            view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
 
-            img = render_candles_png(
-                symbol,
-                "1d",
-                view1d,
-                lines=[
-                    ("PRICE", price),
-                    ("4H_MAX", last4h_high),
-                ],
-                pivot=("PIVOT_RES", pivot_price) if pivot_price else None
-            )
+            # ✅ NEW: 1D dan pivot zone (qizil sham tanasi) olamiz
+            d1 = await get_klines(session, symbol, "1d", 200)
+            zone = last_green_then_red_body_zone(d1)
 
-            cap = f"🟨 near the max | {symbol}\nprice={price}\n4h_max={last4h_high}"
-            if pivot_price:
-                cap += f"\nres(pivot)={pivot_price}"
-            await tg_send_photo(session, cap, img)
+            img = render_candles_png(symbol, "4h", view, [
+                ("PRICE", price),
+                ("4H_MAX", last4h_high),
+            ], pivot_zone=zone)
 
-    # 2) break the max (starts upmove + resets "sell once" latch)
+            await tg_send_photo(session, f"🟨 near the max | {symbol}\nprice={price}\n4h_max={last4h_high}", img)
+
     if price >= last4h_high:
         if ss.get("break_sent_for_4h") != last4h_open:
             ss["break_sent_for_4h"] = last4h_open
             ss["upmove_active"] = True
             ss["upmove_started_4h"] = last4h_open
-
-            # ✅ reset sell-once latch for this break
-            ss["sell_once_done_for_break"] = None
+            ss["sell_sent_15m"] = None
 
             candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
             view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
@@ -367,30 +354,25 @@ async def handle_signals(
             ])
             await tg_send_photo(session, f"🟩 price break the max | {symbol}\nprice={price}\n4h_max={last4h_high}", img)
 
-    # 3) SELL: only ONCE after each break
     if ss.get("upmove_active"):
-        # if already sold for this break -> do nothing
-        if ss.get("sell_once_done_for_break") == ss.get("upmove_started_4h"):
-            return
-
         last15m_low = ss.get("last_15m_low")
         last15m_open = ss.get("last_15m_closed_open")
         if last15m_low and last15m_open:
             if price < last15m_low:
-                # ✅ fire SELL only once per break
-                ss["sell_once_done_for_break"] = ss.get("upmove_started_4h")
+                if ss.get("sell_sent_15m") != last15m_open:
+                    ss["sell_sent_15m"] = last15m_open
 
-                candles15 = await get_klines(session, symbol, "15m", min(CHART_CANDLES, 200))
-                view15 = candles15[-CHART_CANDLES:] if len(candles15) > CHART_CANDLES else candles15
-                img = render_candles_png(symbol, "15m", view15, [
-                    ("PRICE", price),
-                    ("15M_LOW", last15m_low),
-                ])
-                await tg_send_photo(
-                    session,
-                    f"🟥 SELL (once) | {symbol}\nprice={price}\nlast_closed_15m_low={last15m_low}",
-                    img,
-                )
+                    candles15 = await get_klines(session, symbol, "15m", min(CHART_CANDLES, 200))
+                    view15 = candles15[-CHART_CANDLES:] if len(candles15) > CHART_CANDLES else candles15
+                    img = render_candles_png(symbol, "15m", view15, [
+                        ("PRICE", price),
+                        ("15M_LOW", last15m_low),
+                    ])
+                    await tg_send_photo(
+                        session,
+                        f"🟥 SELL | {symbol}\nprice={price}\nlast_closed_15m_low={last15m_low}",
+                        img,
+                    )
 
 # ======================
 # MAIN LOOPS
@@ -447,7 +429,7 @@ async def main():
     connector = aiohttp.TCPConnector(limit=50, ssl=False)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near/break + 15m SELL once + 1D pivot resistance on near")
+        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near/break + 15m sell (spaced candles + last CLOSED centered)")
 
         tasks = [
             asyncio.create_task(loop_refresh_top(session, st)),
