@@ -92,12 +92,12 @@ def sym_state(st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
             "break_sent_for_4h": None,   # 4h open_time
 
             "upmove_active": False,
-            "upmove_started_4h": None,   # 4h open_time that triggered break
+            "upmove_started_4h": None,   # 4h open_time when BUY fired (we will set)
             "sell_sent_15m": None,       # 15m open_time when sell fired
 
-            # ✅ NEW (faqat BUY gating uchun):
-            "buy_armed_daily": None,     # 1D yopilganda shu yerga daily open_time yoziladi
-            "buy_done_daily": None,      # shu daily uchun BUY 1 marta chiqqan bo'lsa daily open_time yoziladi
+            # BUY gating:
+            "buy_armed_daily": None,     # 1D yopilganda daily open_time
+            "buy_done_daily": None,      # shu daily uchun BUY 1 marta chiqqan bo'lsa
         }
         st["symbols"][symbol] = s
     return s
@@ -112,7 +112,7 @@ async def http_get_json(session: aiohttp.ClientSession, url: str, params: Option
 
 async def tg_send_text(session: aiohttp.ClientSession, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    data = {"chat_id": TELELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
     async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=15)) as r:
         await r.text()
 
@@ -185,10 +185,8 @@ def render_candles_png(
     interval: str,
     candles: List[Candle],
     lines: List[Tuple[str, float]],
-    pivot_zone: Optional[Tuple[float, float]] = None,   # ✅ NEW: (zone_low, zone_high)
+    pivot_zone: Optional[Tuple[float, float]] = None,
 ) -> str:
-    # ✅ Candle spacing (orasini ochish)
-    # step katta bo'lsa shamlar uzoqlashadi (aniqroq ko'rinadi)
     step = 2.2
     xs = [i * step for i in range(len(candles))]
 
@@ -201,32 +199,26 @@ def render_candles_png(
     ax = fig.add_subplot(111)
     ax.set_title(f"{symbol} | {interval}")
 
-    # Sham tanasi va soyasi qalinligini step ga mos qilamiz
     wick_lw = 1.1
     body_lw = 6.5
 
     for i in range(len(candles)):
-        ax.vlines(xs[i], l[i], h[i], linewidth=wick_lw)  # wick
+        ax.vlines(xs[i], l[i], h[i], linewidth=wick_lw)
         body_low = min(o[i], cl[i])
         body_high = max(o[i], cl[i])
-        ax.vlines(xs[i], body_low, body_high, linewidth=body_lw)  # body
+        ax.vlines(xs[i], body_low, body_high, linewidth=body_lw)
 
-    # chiziqlar (PRICE / MAX) aniq ko'rinsin
     for label, y in lines:
         ax.hlines(y, xs[0], xs[-1], linestyles="dashed", linewidth=1.4)
         ax.text(xs[0], y, f" {label}:{y:.6f}", va="bottom")
 
-    # ✅ NEW: Pivot resistance zone (qizil sham TANASI: open-close oralig'i)
     if pivot_zone is not None:
         z_low, z_high = pivot_zone
-        # zone chiziqlari
         ax.hlines(z_low, xs[0], xs[-1], linestyles="dashed", linewidth=2.0)
         ax.hlines(z_high, xs[0], xs[-1], linestyles="dashed", linewidth=2.0)
         ax.text(xs[0], z_high, f" RES_BODY:{z_low:.6f}-{z_high:.6f}", va="bottom")
-        # zone fon (shaded)
         ax.fill_between([xs[0], xs[-1]], [z_low, z_low], [z_high, z_high], alpha=0.12)
 
-    # Oxirgi YOPILGAN shamni (candles[-2]) o'rtaga keltiramiz.
     if len(xs) >= 2:
         center = xs[-2]
     else:
@@ -254,12 +246,10 @@ def last_closed(candles: List[Candle]) -> Candle:
         raise ValueError("Not enough candles")
     return candles[-2]
 
-# ✅ NEW: 1D da oxirgi (green -> red) pattern topib,
-# qizil sham TANASI (open-close) zonani qaytaradi.
 def last_green_then_red_body_zone(d1: List[Candle]) -> Optional[Tuple[float, float]]:
     if len(d1) < 4:
         return None
-    closed = d1[:-1]  # forming candle'ni chiqarib tashlaymiz
+    closed = d1[:-1]
     for i in range(len(closed) - 1, 0, -1):
         prev = closed[i - 1]
         cur = closed[i]
@@ -296,11 +286,8 @@ async def refresh_symbol_klines_cached(
         elif interval == "1d":
             if ss["last_1d_closed_open"] != closed.open_time:
                 ss["last_1d_closed_open"] = closed.open_time
-
-                # ✅ NEW: 1D yopilganda BUY'ni "arm" qilamiz (shu daily uchun 1 marta ruxsat)
                 ss["buy_armed_daily"] = closed.open_time
                 ss["buy_done_daily"] = None
-
                 await tg_send_text(session, f"📅 DAILY CLOSED | {symbol} | close={closed.close}")
         elif interval == "4h":
             if ss["last_4h_closed_open"] != closed.open_time:
@@ -337,7 +324,6 @@ async def handle_signals(
             candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
             view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
 
-            # 1D dan pivot zone (qizil sham tanasi) olamiz
             d1 = await get_klines(session, symbol, "1d", 200)
             zone = last_green_then_red_body_zone(d1)
 
@@ -348,17 +334,18 @@ async def handle_signals(
 
             await tg_send_photo(session, f"🟨 near the max | {symbol}\nprice={price}\n4h_max={last4h_high}", img)
 
-    # ✅ NEW: 1D yopilgandan keyin faqat 1 marta BUY
-    # Shart:
-    # - daily yopilgan bo'lishi kerak (buy_armed_daily == last_1d_closed_open)
-    # - shu daily uchun hali BUY chiqmagan bo'lishi kerak (buy_done_daily != last_1d_closed_open)
-    # - price oxirgi yopilgan 4H high ni kesib o'tishi kerak (price >= last4h_high)
+    # ✅ BUY ONLY (daily 1x) + BUY bo'lganda upmove_active yoqiladi
     if (
         ss.get("buy_armed_daily") == daily_closed_open
         and ss.get("buy_done_daily") != daily_closed_open
         and price >= last4h_high
     ):
         ss["buy_done_daily"] = daily_closed_open
+
+        # ✅ NEW: BUY chiqqanda SELL tizimi ishlashi uchun yoqamiz
+        ss["upmove_active"] = True
+        ss["upmove_started_4h"] = last4h_open
+        ss["sell_sent_15m"] = None
 
         candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
         view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
@@ -372,22 +359,7 @@ async def handle_signals(
             img,
         )
 
-    # (old) break the max — tegmadim
-    if price >= last4h_high:
-        if ss.get("break_sent_for_4h") != last4h_open:
-            ss["break_sent_for_4h"] = last4h_open
-            ss["upmove_active"] = True
-            ss["upmove_started_4h"] = last4h_open
-            ss["sell_sent_15m"] = None
-
-            candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
-            view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
-            img = render_candles_png(symbol, "4h", view, [
-                ("PRICE", price),
-                ("4H_MAX", last4h_high),
-            ])
-            await tg_send_photo(session, f"🟩 price break the max | {symbol}\nprice={price}\n4h_max={last4h_high}", img)
-
+    # SELL (endi BUY bo'lgandan keyin ishlaydi)
     if ss.get("upmove_active"):
         last15m_low = ss.get("last_15m_low")
         last15m_open = ss.get("last_15m_closed_open")
@@ -463,7 +435,7 @@ async def main():
     connector = aiohttp.TCPConnector(limit=50, ssl=False)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near/break + 15m sell (spaced candles + last CLOSED centered)")
+        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near + BUY(daily 1x) + SELL(after BUY)")
 
         tasks = [
             asyncio.create_task(loop_refresh_top(session, st)),
