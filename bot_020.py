@@ -1,18 +1,12 @@
 import os
 import time
-import math
 import json
 import asyncio
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 
 import aiohttp
 from dotenv import load_dotenv
-
-# chart
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 load_dotenv()
 
@@ -26,21 +20,18 @@ TOP_N = int(os.getenv("TOP_N") or "50")
 
 SCAN_PRICE_SEC = float(os.getenv("SCAN_PRICE_SEC") or "5")           # price poll
 REFRESH_TOP_SEC = float(os.getenv("REFRESH_TOP_SEC") or "120")       # top gainers refresh
-REFRESH_KLINES_SEC = float(os.getenv("REFRESH_KLINES_SEC") or "60")  # kline refresh (cached)
+REFRESH_KLINES_SEC = float(os.getenv("REFRESH_KLINES_SEC") or "60")  # kline refresh
 
-NEAR_PCT = float(os.getenv("NEAR_PCT") or "0.01")  # 1% near max
-CHART_CANDLES = int(os.getenv("CHART_CANDLES") or "120")
+NEAR_PCT = float(os.getenv("NEAR_PCT") or "0.02")  # 2% near daily high
 
-STATE_FILE = os.getenv("STATE_FILE") or "state_top50_signals.json"
-
-# Binance endpoints (public)
+STATE_FILE = os.getenv("STATE_FILE") or "state_weekly_daily_buy.json"
 BINANCE_BASE = (os.getenv("BINANCE_BASE") or "https://data-api.binance.vision").strip()
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID yo'q")
 
 # ======================
-# DATA STRUCTS
+# DATA
 # ======================
 @dataclass
 class Candle:
@@ -65,7 +56,7 @@ def load_state() -> Dict[str, Any]:
         except Exception:
             pass
     return {
-        "symbols": {},  # per symbol state
+        "symbols": {},
         "top_symbols": [],
         "last_top_refresh_ms": 0,
     }
@@ -80,30 +71,20 @@ def sym_state(st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     s = st["symbols"].get(symbol)
     if not s:
         s = {
-            "last_1d_closed_open": None,
             "last_1w_closed_open": None,
-            "last_4h_closed_open": None,
-            "last_15m_closed_open": None,
+            "last_1d_closed_open": None,
 
-            "last_4h_high": None,   # last CLOSED 4h high
-            "last_15m_low": None,   # last CLOSED 15m low
+            "last_1d_high": None,         # last CLOSED 1D high
 
-            "near_sent_for_4h": None,    # 4h open_time
-            "break_sent_for_4h": None,   # 4h open_time
-
-            "upmove_active": False,
-            "upmove_started_4h": None,   # 4h open_time when BUY fired (we will set)
-            "sell_sent_15m": None,       # 15m open_time when sell fired
-
-            # BUY gating:
-            "buy_armed_daily": None,     # 1D yopilganda daily open_time
-            "buy_done_daily": None,      # shu daily uchun BUY 1 marta chiqqan bo'lsa
+            # Weekly arm -> Daily near-high BUY (1x)
+            "armed_weekly": None,         # weekly open_time that armed
+            "buy_done_weekly": None,      # same weekly open_time when buy already fired
         }
         st["symbols"][symbol] = s
     return s
 
 # ======================
-# HTTP HELPERS
+# HTTP / TG
 # ======================
 async def http_get_json(session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
@@ -116,18 +97,8 @@ async def tg_send_text(session: aiohttp.ClientSession, text: str) -> None:
     async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=15)) as r:
         await r.text()
 
-async def tg_send_photo(session: aiohttp.ClientSession, caption: str, image_path: str) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    with open(image_path, "rb") as f:
-        form = aiohttp.FormData()
-        form.add_field("chat_id", TELEGRAM_CHAT_ID)
-        form.add_field("caption", caption)
-        form.add_field("photo", f, filename=os.path.basename(image_path), content_type="image/png")
-        async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=30)) as r:
-            await r.text()
-
 # ======================
-# BINANCE DATA
+# BINANCE
 # ======================
 async def get_top_gainers(session: aiohttp.ClientSession, top_n: int) -> List[str]:
     url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
@@ -144,7 +115,7 @@ async def get_top_gainers(session: aiohttp.ClientSession, top_n: int) -> List[st
             continue
         try:
             pct = float(x.get("priceChangePercent", "0") or "0")
-        except:
+        except Exception:
             continue
         usdt.append((sym, pct))
 
@@ -177,211 +148,69 @@ async def get_price_map(session: aiohttp.ClientSession, symbols: List[str]) -> D
             mp[sym] = float(x["price"])
     return mp
 
-# ======================
-# CHART RENDER
-# ======================
-def render_candles_png(
-    symbol: str,
-    interval: str,
-    candles: List[Candle],
-    lines: List[Tuple[str, float]],
-    pivot_zone: Optional[Tuple[float, float]] = None,
-) -> str:
-    step = 2.2
-    xs = [i * step for i in range(len(candles))]
-
-    o = [c.open for c in candles]
-    h = [c.high for c in candles]
-    l = [c.low for c in candles]
-    cl = [c.close for c in candles]
-
-    fig = plt.figure(figsize=(10, 5))
-    ax = fig.add_subplot(111)
-    ax.set_title(f"{symbol} | {interval}")
-
-    wick_lw = 1.1
-    body_lw = 6.5
-
-    for i in range(len(candles)):
-        ax.vlines(xs[i], l[i], h[i], linewidth=wick_lw)
-        body_low = min(o[i], cl[i])
-        body_high = max(o[i], cl[i])
-        ax.vlines(xs[i], body_low, body_high, linewidth=body_lw)
-
-    for label, y in lines:
-        ax.hlines(y, xs[0], xs[-1], linestyles="dashed", linewidth=1.4)
-        ax.text(xs[0], y, f" {label}:{y:.6f}", va="bottom")
-
-    if pivot_zone is not None:
-        z_low, z_high = pivot_zone
-        ax.hlines(z_low, xs[0], xs[-1], linestyles="dashed", linewidth=2.0)
-        ax.hlines(z_high, xs[0], xs[-1], linestyles="dashed", linewidth=2.0)
-        ax.text(xs[0], z_high, f" RES_BODY:{z_low:.6f}-{z_high:.6f}", va="bottom")
-        ax.fill_between([xs[0], xs[-1]], [z_low, z_low], [z_high, z_high], alpha=0.12)
-
-    if len(xs) >= 2:
-        center = xs[-2]
-    else:
-        center = xs[-1]
-
-    half = max(10, len(xs) // 2) * step
-    left = max(0.0, center - half)
-    right = center + half
-    ax.set_xlim(left, right)
-
-    ax.grid(True, linewidth=0.3)
-    ax.set_xticks([])
-
-    out_path = f"/tmp/{symbol}_{interval}_{int(time.time())}.png"
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=180)
-    plt.close(fig)
-    return out_path
-
-# ======================
-# LOGIC
-# ======================
 def last_closed(candles: List[Candle]) -> Candle:
     if len(candles) < 2:
         raise ValueError("Not enough candles")
     return candles[-2]
 
-def last_green_then_red_body_zone(d1: List[Candle]) -> Optional[Tuple[float, float]]:
-    if len(d1) < 4:
-        return None
-    closed = d1[:-1]
-    for i in range(len(closed) - 1, 0, -1):
-        prev = closed[i - 1]
-        cur = closed[i]
-        prev_green = prev.close > prev.open
-        cur_red = cur.close < cur.open
-        if prev_green and cur_red:
-            z_low = min(cur.open, cur.close)
-            z_high = max(cur.open, cur.close)
-            return (z_low, z_high)
-    return None
-
-async def refresh_symbol_klines_cached(
-    session: aiohttp.ClientSession,
-    st: Dict[str, Any],
-    symbol: str,
-    cache: Dict[str, Dict[str, Any]],
-) -> None:
-    for interval, limit in [("1w", 3), ("1d", 3), ("4h", 5), ("15m", 5)]:
-        entry = cache.setdefault(symbol, {}).get(interval)
-        tnow = now_ms()
-        if entry and (tnow - entry["t"] < int(REFRESH_KLINES_SEC * 1000)):
-            continue
-
-        candles = await get_klines(session, symbol, interval, limit)
-        cache.setdefault(symbol, {})[interval] = {"t": tnow, "candles": candles}
-
-        ss = sym_state(st, symbol)
-        closed = last_closed(candles)
-
-        if interval == "1w":
-            if ss["last_1w_closed_open"] != closed.open_time:
-                ss["last_1w_closed_open"] = closed.open_time
-                await tg_send_text(session, f"🗓 WEEKLY CLOSED | {symbol} | close={closed.close}")
-        elif interval == "1d":
-            if ss["last_1d_closed_open"] != closed.open_time:
-                ss["last_1d_closed_open"] = closed.open_time
-                ss["buy_armed_daily"] = closed.open_time
-                ss["buy_done_daily"] = None
-                await tg_send_text(session, f"📅 DAILY CLOSED | {symbol} | close={closed.close}")
-        elif interval == "4h":
-            if ss["last_4h_closed_open"] != closed.open_time:
-                ss["last_4h_closed_open"] = closed.open_time
-                ss["last_4h_high"] = closed.high
-                ss["near_sent_for_4h"] = None
-                ss["break_sent_for_4h"] = None
-        elif interval == "15m":
-            if ss["last_15m_closed_open"] != closed.open_time:
-                ss["last_15m_closed_open"] = closed.open_time
-                ss["last_15m_low"] = closed.low
-
-async def handle_signals(
-    session: aiohttp.ClientSession,
-    st: Dict[str, Any],
-    symbol: str,
-    price: float,
-    cache: Dict[str, Dict[str, Any]],
-) -> None:
+# ======================
+# CORE LOGIC
+# ======================
+async def refresh_weekly_daily(session: aiohttp.ClientSession, st: Dict[str, Any], symbol: str) -> None:
     ss = sym_state(st, symbol)
 
-    last4h_high = ss.get("last_4h_high")
-    last4h_open = ss.get("last_4h_closed_open")
-    daily_closed_open = ss.get("last_1d_closed_open")
+    # weekly
+    w = await get_klines(session, symbol, "1w", 3)
+    w_closed = last_closed(w)
+    if ss["last_1w_closed_open"] != w_closed.open_time:
+        ss["last_1w_closed_open"] = w_closed.open_time
 
-    if not last4h_high or not last4h_open or not daily_closed_open:
+        # ✅ Haftalik yopilganda "arm" qilamiz va buy_done ni reset qilamiz
+        ss["armed_weekly"] = w_closed.open_time
+        ss["buy_done_weekly"] = None
+
+        await tg_send_text(session, f"🗓 WEEKLY CLOSED | {symbol} | close={w_closed.close}")
+
+    # daily
+    d = await get_klines(session, symbol, "1d", 3)
+    d_closed = last_closed(d)
+    if ss["last_1d_closed_open"] != d_closed.open_time:
+        ss["last_1d_closed_open"] = d_closed.open_time
+        ss["last_1d_high"] = d_closed.high
+
+        await tg_send_text(session, f"📅 DAILY CLOSED | {symbol} | high={d_closed.high} | close={d_closed.close}")
+
+async def handle_signals(session: aiohttp.ClientSession, st: Dict[str, Any], symbol: str, price: float) -> None:
+    ss = sym_state(st, symbol)
+
+    weekly_closed_open = ss.get("last_1w_closed_open")
+    armed_weekly = ss.get("armed_weekly")
+    buy_done_weekly = ss.get("buy_done_weekly")
+
+    last_1d_high = ss.get("last_1d_high")
+    if not weekly_closed_open or not armed_weekly or not last_1d_high:
         return
 
-    near_level = last4h_high * (1.0 - NEAR_PCT)
-    if price >= near_level and price < last4h_high:
-        if ss.get("near_sent_for_4h") != last4h_open:
-            ss["near_sent_for_4h"] = last4h_open
+    # ✅ Asosiy shart:
+    # haftalik yopilgandan keyin (armed_weekly == weekly_closed_open),
+    # faqat 1 marta: price daily_high ga 2% qolsa BUY.
+    if armed_weekly == weekly_closed_open and buy_done_weekly != weekly_closed_open:
+        near_level = last_1d_high * (1.0 - NEAR_PCT)  # 2% below daily high
+        if price >= near_level and price < last_1d_high:
+            ss["buy_done_weekly"] = weekly_closed_open
 
-            candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
-            view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
-
-            d1 = await get_klines(session, symbol, "1d", 200)
-            zone = last_green_then_red_body_zone(d1)
-
-            img = render_candles_png(symbol, "4h", view, [
-                ("PRICE", price),
-                ("4H_MAX", last4h_high),
-            ], pivot_zone=zone)
-
-            await tg_send_photo(session, f"🟨 near the max | {symbol}\nprice={price}\n4h_max={last4h_high}", img)
-
-    # ✅ BUY ONLY (daily 1x) + BUY bo'lganda upmove_active yoqiladi
-    if (
-        ss.get("buy_armed_daily") == daily_closed_open
-        and ss.get("buy_done_daily") != daily_closed_open
-        and price >= last4h_high
-    ):
-        ss["buy_done_daily"] = daily_closed_open
-
-        # ✅ NEW: BUY chiqqanda SELL tizimi ishlashi uchun yoqamiz
-        ss["upmove_active"] = True
-        ss["upmove_started_4h"] = last4h_open
-        ss["sell_sent_15m"] = None
-
-        candles = await get_klines(session, symbol, "4h", min(CHART_CANDLES, 200))
-        view = candles[-CHART_CANDLES:] if len(candles) > CHART_CANDLES else candles
-        img = render_candles_png(symbol, "4h", view, [
-            ("PRICE", price),
-            ("4H_MAX", last4h_high),
-        ])
-        await tg_send_photo(
-            session,
-            f"🟦 BUY (daily 1x) | {symbol}\nprice={price}\n4h_max={last4h_high}",
-            img,
-        )
-
-    # SELL (endi BUY bo'lgandan keyin ishlaydi)
-    if ss.get("upmove_active"):
-        last15m_low = ss.get("last_15m_low")
-        last15m_open = ss.get("last_15m_closed_open")
-        if last15m_low and last15m_open:
-            if price < last15m_low:
-                if ss.get("sell_sent_15m") != last15m_open:
-                    ss["sell_sent_15m"] = last15m_open
-
-                    candles15 = await get_klines(session, symbol, "15m", min(CHART_CANDLES, 200))
-                    view15 = candles15[-CHART_CANDLES:] if len(candles15) > CHART_CANDLES else candles15
-                    img = render_candles_png(symbol, "15m", view15, [
-                        ("PRICE", price),
-                        ("15M_LOW", last15m_low),
-                    ])
-                    await tg_send_photo(
-                        session,
-                        f"🟥 SELL | {symbol}\nprice={price}\nlast_closed_15m_low={last15m_low}",
-                        img,
-                    )
+            dist_pct = (last_1d_high - price) / last_1d_high * 100.0
+            await tg_send_text(
+                session,
+                f"🟦 BUY (weekly->daily 1x)\n"
+                f"{symbol}\n"
+                f"price={price}\n"
+                f"daily_high={last_1d_high}\n"
+                f"remaining_to_high={dist_pct:.2f}% (target 2%)"
+            )
 
 # ======================
-# MAIN LOOPS
+# LOOPS
 # ======================
 async def loop_refresh_top(session: aiohttp.ClientSession, st: Dict[str, Any]) -> None:
     while True:
@@ -389,13 +218,13 @@ async def loop_refresh_top(session: aiohttp.ClientSession, st: Dict[str, Any]) -
             syms = await get_top_gainers(session, TOP_N)
             st["top_symbols"] = syms
             st["last_top_refresh_ms"] = now_ms()
-            await tg_send_text(session, f"✅ Top {TOP_N} gainers updated. Tracking: {len(syms)} symbols")
+            await tg_send_text(session, f"✅ Top {TOP_N} gainers updated. Tracking: {len(syms)}")
             save_state(st)
         except Exception as e:
             await tg_send_text(session, f"⚠️ Top refresh error: {type(e).__name__}: {e}")
         await asyncio.sleep(REFRESH_TOP_SEC)
 
-async def loop_refresh_klines(session: aiohttp.ClientSession, st: Dict[str, Any], cache: Dict[str, Dict[str, Any]]) -> None:
+async def loop_refresh_klines(session: aiohttp.ClientSession, st: Dict[str, Any]) -> None:
     while True:
         syms = st.get("top_symbols") or []
         if not syms:
@@ -403,13 +232,13 @@ async def loop_refresh_klines(session: aiohttp.ClientSession, st: Dict[str, Any]
             continue
         for symbol in syms:
             try:
-                await refresh_symbol_klines_cached(session, st, symbol, cache)
+                await refresh_weekly_daily(session, st, symbol)
             except Exception as e:
                 print("kline refresh error", symbol, e)
         save_state(st)
         await asyncio.sleep(REFRESH_KLINES_SEC)
 
-async def loop_prices(session: aiohttp.ClientSession, st: Dict[str, Any], cache: Dict[str, Dict[str, Any]]) -> None:
+async def loop_prices(session: aiohttp.ClientSession, st: Dict[str, Any]) -> None:
     while True:
         syms = st.get("top_symbols") or []
         if not syms:
@@ -419,7 +248,7 @@ async def loop_prices(session: aiohttp.ClientSession, st: Dict[str, Any], cache:
             price_map = await get_price_map(session, syms)
             for symbol, price in price_map.items():
                 try:
-                    await handle_signals(session, st, symbol, price, cache)
+                    await handle_signals(session, st, symbol, price)
                 except Exception as e:
                     print("signal error", symbol, e)
             save_state(st)
@@ -429,18 +258,17 @@ async def loop_prices(session: aiohttp.ClientSession, st: Dict[str, Any], cache:
 
 async def main():
     st = load_state()
-    cache: Dict[str, Dict[str, Any]] = {}
 
     timeout = aiohttp.ClientTimeout(total=20)
     connector = aiohttp.TCPConnector(limit=50, ssl=False)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        await tg_send_text(session, "🚀 Bot started: Top50 + 4H near + BUY(daily 1x) + SELL(after BUY)")
+        await tg_send_text(session, "🚀 Bot started: Weekly close -> (1x) BUY when price is within 2% of last CLOSED Daily HIGH")
 
         tasks = [
             asyncio.create_task(loop_refresh_top(session, st)),
-            asyncio.create_task(loop_refresh_klines(session, st, cache)),
-            asyncio.create_task(loop_prices(session, st, cache)),
+            asyncio.create_task(loop_refresh_klines(session, st)),
+            asyncio.create_task(loop_prices(session, st)),
         ]
         await asyncio.gather(*tasks)
 
