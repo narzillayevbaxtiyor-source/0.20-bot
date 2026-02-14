@@ -218,7 +218,10 @@ async def loop_refresh_top(session: aiohttp.ClientSession, st: Dict[str, Any]) -
             syms = await get_top_gainers(session, TOP_N)
             st["top_symbols"] = syms
             st["last_top_refresh_ms"] = now_ms()
-            await tg_send_text(session, f"✅ Top {TOP_N} gainers updated. Tracking: {len(syms)}")
+
+            # ✅ Top 50 update xabari Telegramga bormaydi (faqat log)
+            print(f"✅ Top {TOP_N} gainers updated. Tracking: {len(syms)}")
+
             save_state(st)
         except Exception as e:
             await tg_send_text(session, f"⚠️ Top refresh error: {type(e).__name__}: {e}")
